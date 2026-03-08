@@ -1,10 +1,18 @@
 # Context Doc: Ninebot F2 Pro BMS Cell Voltage Diagnostic Tool
 
 ## Goal
-Build a Python CLI tool that connects to a Segway Ninebot F2 Pro electric scooter over Bluetooth Low Energy (BLE) and reads individual cell group voltages from the Battery Management System (BMS). This is a READ-ONLY diagnostic tool. Do NOT write any data to the scooter.
+Build a Python CLI tool that connects to a Segway Ninebot F2 Pro electric scooter over Bluetooth Low Energy (BLE) and communicates with the Battery Management System (BMS). The tool should support both reading diagnostics AND writing to registers/resetting the BMS to attempt to fix the scooter. Bricking risk is accepted.
 
 ## Why
-The scooter's BMS firmware (V1.3.4) is cutting off charging at 23% due to detected cell imbalance. We need to read the voltage of each of the 10 series cell groups to determine which cells are low and how severe the imbalance is. The owner has an iPhone and can't use Android-only diagnostic apps (ScooterHacking Utility, Nine Dash, XiaoDash), so we're building a laptop-based tool.
+After a BMS firmware update, the scooter won't charge above 23% and drains to ~10% overnight, dying after ~3 meters of riding. The scooter is effectively bricked already. The owner has an iPhone and can't use Android-only diagnostic apps (ScooterHacking Utility, Nine Dash, XiaoDash), so we're building a laptop-based tool to diagnose AND attempt to fix the issue.
+
+### Suspected Root Cause
+The BMS firmware update (V1.3.4) likely miscalibrated one or more of:
+- State-of-charge (SOC) parameters / capacity calibration
+- Cell balance thresholds (falsely detecting imbalance)
+- Error/fault flags that cap charging
+- Charge voltage/current limits
+- The overnight drain suggests a parasitic draw or the BMS staying awake in a fault state
 
 ## Scooter Details
 - **Model**: Segway Ninebot F2 Pro
@@ -12,8 +20,9 @@ The scooter's BMS firmware (V1.3.4) is cutting off charging at 23% due to detect
 - **Battery serial**: 16DGJ24G2F0712
 - **BMS firmware**: V1.3.4
 - **Battery config**: 10S (10 series cell groups), 36V nominal, 460Wh, 12800mAh total
-- **Current state**: 15% charge, 35.6V pack voltage, not accepting charge above 23%
+- **Current state**: 15% charge, 35.6V pack voltage, won't charge above 23%, drains to ~10% overnight, dies after ~3m riding
 - **Battery health**: 95.8% (12262/12800 mAh), 85 charge cycles
+- **Trigger**: Problems started after a BMS firmware update
 
 ## Protocol Documentation
 
@@ -86,7 +95,7 @@ Based on community reverse engineering (etransport/ninebot-docs, ScooterHacking 
 | 0x26 | U16 | Temperature 1 (0.1°C) |
 | 0x27 | U16 | Temperature 2 (0.1°C) |
 | 0x2A | U16 | Health / remaining capacity |
-| 0x30-0x39 | U16 each | **Cell group voltages** (10 cells for 10S) |
+| 0x40-0x49 | U16 each | **Cell group voltages** (10 cells for 10S) — CORRECTED from 0x30 |
 | 0x3B | U16 | Charge cycles |
 
 **CRITICAL**: The cell voltage registers are the primary target. For a 10S pack, registers 0x30 through 0x39 should each contain a U16 value representing individual cell group voltage in millivolts.
@@ -182,9 +191,17 @@ UART_CHAR = "0000ffe1-0000-1000-8000-00805f9b34fb"     # May vary
    - Scanning a wider range of BMS registers (0x00-0x50) to map the register layout
    - The F2 may use different cell voltage register offsets
 
-5. **READ ONLY**: This tool must NEVER write to any register. Only use cmd=0x01 (read). Never use cmd=0x02 or 0x03 (write).
+5. **READ AND WRITE**: This tool supports both read (cmd=0x01) and write (cmd=0x02/0x03) operations. The scooter is effectively bricked already, so bricking risk from writes is accepted. Write operations should still prompt for confirmation before executing.
 
 6. **Fallback discovery mode**: If known registers don't return expected values, implement a register scanner that reads registers 0x00 through 0x50 from the BMS and dumps all values. We can then manually identify which registers contain cell voltages (they'll be U16 values in the 2500-4250 range for millivolts, or 250-425 range for centimillivolts).
+
+7. **Fix strategies to implement** (in order of least to most aggressive):
+   a. **Clear error flags**: Write to error/fault registers to clear any stuck fault conditions
+   b. **Reset SOC calibration**: Write to capacity/SOC registers to reset the state-of-charge tracking
+   c. **Reset charge limits**: Write to charge voltage/current limit registers if they've been misconfigured
+   d. **BMS soft reset**: Send a reset command to the BMS to force a clean restart
+   e. **Firmware rollback**: If the BMS supports it, attempt to flash the previous firmware version
+   f. **Full register dump + manual analysis**: Dump all registers before and after any write attempts for comparison
 
 ## Reference Repositories
 - `github.com/etransport/py9b` — Ninebot/Xiaomi communication library (Python, GPL-3.0). Has BLE transport, packet handling, and firmware flashing. Study the transport and command layers but don't use the flashing code.
@@ -222,9 +239,14 @@ Cells needing balance charge: 6, 7
 (The above is example output — actual values will differ.)
 
 ## What to Do With Results
-Once we have the cell voltages, we can determine:
-1. How many cells are low and by how much
-2. Whether any cells are dead (voltage < 2.5V = unrecoverable)
-3. Whether passive balancing (leaving charger plugged in 72hrs) might work (delta < 0.3V)
-4. Whether manual cell balancing is needed (delta > 0.3V)
-5. Whether any cells are swelling/dangerous (voltage spikes to 4.2V instantly = high internal resistance)
+Once we have the cell voltages and register dump, we can:
+1. Determine cell health and imbalance severity
+2. Identify any stuck error/fault flags from the firmware update
+3. Compare register values against known-good values from the community
+4. Attempt targeted writes to fix the charging cutoff
+5. If all else fails, attempt a BMS reset or firmware rollback
+
+## Approach
+1. **Phase 1 — Diagnose**: Full register dump (0x00-0x50), cell voltages, error flags, SOC params
+2. **Phase 2 — Targeted fix**: Based on diagnostics, write to specific registers to clear faults / reset calibration
+3. **Phase 3 — Nuclear options**: BMS reset, firmware rollback if targeted fixes don't work

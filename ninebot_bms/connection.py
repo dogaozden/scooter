@@ -492,12 +492,7 @@ class NinebotConnection:
 
         logger.debug("_auth_send_and_wait: sending %s (%d bytes), timeout=%.1f",
                      data.hex(), len(data), timeout)
-        try:
-            await self.send_raw(data, response=True)
-        except Exception:
-            # Some NUS characteristics only support write-without-response
-            logger.debug("_auth_send_and_wait: response=True failed, retrying without")
-            await self.send_raw(data, response=False)
+        await self.send_raw(data)
         logger.debug("_auth_send_and_wait: send_raw done, waiting for response...")
 
         try:
@@ -619,14 +614,12 @@ class NinebotConnection:
     # Send primitives
     # ------------------------------------------------------------------
 
-    async def send_raw(self, data: bytes, response: bool = False) -> None:
+    async def send_raw(self, data: bytes) -> None:
         """Fragment *data* into BLE_CHUNK_SIZE chunks and write to scooter.
 
-        Each chunk is written to the RX characteristic.  *response*
-        controls whether we wait for a GATT write-ack per chunk
-        (True = reliable but slower, used during auth).
-        A 20 ms delay is inserted between chunks when fragmentation
-        is needed.
+        Each chunk is written to the RX characteristic with
+        ``response=False``. A 20 ms delay is inserted between chunks
+        when fragmentation is needed.
         """
         if self._client is None or not self._client.is_connected:
             raise RuntimeError("Not connected")
@@ -637,7 +630,7 @@ class NinebotConnection:
             end = min(offset + self.BLE_CHUNK_SIZE, total)
             chunk = data[offset:end]
             await self._client.write_gatt_char(
-                self._rx_uuid, chunk, response=response
+                self._rx_uuid, chunk, response=False
             )
             offset = end
             if offset < total:

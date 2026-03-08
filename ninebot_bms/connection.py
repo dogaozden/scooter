@@ -101,6 +101,24 @@ class NinebotConnection:
         Returns True on success.
         """
         self._loop = asyncio.get_running_loop()
+        # Clean up any previous connection first
+        if self._client is not None:
+            try:
+                await self._client.stop_notify(self._tx_uuid)
+            except Exception:
+                pass
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
+            await asyncio.sleep(0.5)  # Let CoreBluetooth clean up
+
+        # Reset all state from any previous connection
+        self._authenticated = False
+        self._crypto = None
+        self._buf.clear()
+        self._response_future = None
         self._client = BleakClient(address, timeout=timeout)
 
         try:
@@ -127,6 +145,9 @@ class NinebotConnection:
         # Subscribe to notifications on the TX characteristic
         try:
             await self._client.start_notify(self._tx_uuid, self._on_notify)
+            # Give macOS CoreBluetooth time to finish the CCCD write
+            await asyncio.sleep(0.5)
+            logger.debug("Notification subscription active on %s", self._tx_uuid)
         except Exception as exc:
             logger.error("Failed to subscribe to notifications: %s", exc)
             await self._client.disconnect()
@@ -227,21 +248,37 @@ class NinebotConnection:
             logger.error("Cannot authenticate: not connected")
             return False
 
-        # Initialize NbCrypto
-        self._crypto = NbCrypto()
-        self._crypto.set_name(self._device_name)
+        # Reset state from any previous session so _on_notify uses
+        # the auth branch, not the post-auth branch.
+        self._authenticated = False
+        self._buf.clear()
+        self._response_future = None
 
         app_key = secrets.token_bytes(16)
 
         # ---------------------------------------------------------------
-        # Stage 1: INIT
+        # Stage 1: INIT (with retries — macOS BLE can be slow)
         # ---------------------------------------------------------------
         print("Authenticating...")
 
-        init_cmd = NbCommand.CMD_INIT  # 5AA5 00 3D21 5B 00
-        init_encrypted = self._crypto.encrypt(init_cmd)
+        init_response = None
+        for init_attempt in range(3):
+            # Re-create crypto for each attempt (encrypt mutates state)
+            self._crypto = NbCrypto()
+            self._crypto.set_name(self._device_name)
+            init_cmd = NbCommand.CMD_INIT  # 5AA5 00 3D21 5B 00
+            init_encrypted = self._crypto.encrypt(init_cmd)
 
-        init_response = await self._auth_send_and_wait(init_encrypted, timeout=5.0)
+            init_response = await self._auth_send_and_wait(
+                init_encrypted, timeout=5.0
+            )
+            if init_response is not None:
+                break
+            logger.warning(
+                "INIT attempt %d/3 timed out, retrying...", init_attempt + 1
+            )
+            await asyncio.sleep(1.0)
+
         if init_response is None:
             print("No response to INIT — trying unencrypted fallback...")
             return await self._try_unencrypted_fallback()
@@ -453,12 +490,24 @@ class NinebotConnection:
         auth_future: asyncio.Future[bytes] = self._loop.create_future()
         self._response_future = auth_future
 
-        await self.send_raw(data)
+        logger.debug("_auth_send_and_wait: sending %s (%d bytes), timeout=%.1f",
+                     data.hex(), len(data), timeout)
+        try:
+            await self.send_raw(data, response=True)
+        except Exception:
+            # Some NUS characteristics only support write-without-response
+            logger.debug("_auth_send_and_wait: response=True failed, retrying without")
+            await self.send_raw(data, response=False)
+        logger.debug("_auth_send_and_wait: send_raw done, waiting for response...")
 
         try:
             result = await asyncio.wait_for(auth_future, timeout=timeout)
+            logger.debug("_auth_send_and_wait: got response %s (%d bytes)",
+                         result.hex(), len(result))
             return result
         except asyncio.TimeoutError:
+            logger.debug("_auth_send_and_wait: TIMEOUT after %.1fs (buf=%s, %d bytes)",
+                         timeout, self._buf.hex(), len(self._buf))
             return None
         finally:
             self._response_future = None
@@ -480,6 +529,14 @@ class NinebotConnection:
         the Ninebot protocol ``extract_packet`` function is used.
         """
         incoming = bytes(data)
+        logger.debug(
+            "_on_notify TOP: incoming=%s (%d bytes) auth=%s crypto=%s future=%s",
+            incoming.hex(), len(incoming),
+            self._authenticated,
+            self._crypto is not None,
+            self._response_future is not None and not self._response_future.done()
+            if self._response_future else None,
+        )
 
         if self._authenticated and self._crypto is not None:
             # Post-auth: incoming data is encrypted.
@@ -517,10 +574,14 @@ class NinebotConnection:
                     logger.debug("_on_notify: decrypt error (partial data?): %s", exc)
         elif not self._authenticated and self._crypto is not None:
             # During auth: accumulate and check miauth framing
+            logger.debug("_on_notify AUTH branch: incoming=%s (%d bytes)",
+                         incoming.hex(), len(incoming))
             if incoming[:2] == b"\x5a\xa5":
                 self._buf = bytearray(incoming)
+                logger.debug("_on_notify AUTH: new message start, buf reset")
             else:
                 self._buf.extend(incoming)
+                logger.debug("_on_notify AUTH: appended, buf now %d bytes", len(self._buf))
 
             # miauth completeness check: total = buf[2] + 7
             # (from NbClient.main_handler: len(dec) == receive_buffer[2] + 7)
@@ -528,10 +589,18 @@ class NinebotConnection:
             # is complete when we have buf[2] + 13 bytes (3 header + 4 base + payload + 4 MAC + 2 iter).
             if len(self._buf) >= 3:
                 expected_len = self._buf[2] + 13
+                logger.debug("_on_notify AUTH: buf=%s (%d bytes), buf[2]=0x%02X, expected_len=%d",
+                             self._buf.hex(), len(self._buf), self._buf[2], expected_len)
                 if len(self._buf) >= expected_len:
+                    logger.debug("_on_notify AUTH: COMPLETE! resolving future (future=%s)",
+                                 self._response_future is not None and not self._response_future.done()
+                                 if self._response_future else None)
                     if self._response_future and not self._response_future.done():
                         self._response_future.set_result(bytes(self._buf))
                     self._buf.clear()
+                else:
+                    logger.debug("_on_notify AUTH: incomplete, need %d more bytes",
+                                 expected_len - len(self._buf))
         else:
             # No crypto at all (unencrypted fallback mode)
             if incoming[:2] == b"\x5a\xa5":
@@ -550,12 +619,14 @@ class NinebotConnection:
     # Send primitives
     # ------------------------------------------------------------------
 
-    async def send_raw(self, data: bytes) -> None:
+    async def send_raw(self, data: bytes, response: bool = False) -> None:
         """Fragment *data* into BLE_CHUNK_SIZE chunks and write to scooter.
 
-        Each chunk is written to the RX characteristic with
-        ``response=False``. A 20 ms delay is inserted between chunks
-        when fragmentation is needed.
+        Each chunk is written to the RX characteristic.  *response*
+        controls whether we wait for a GATT write-ack per chunk
+        (True = reliable but slower, used during auth).
+        A 20 ms delay is inserted between chunks when fragmentation
+        is needed.
         """
         if self._client is None or not self._client.is_connected:
             raise RuntimeError("Not connected")
@@ -566,7 +637,7 @@ class NinebotConnection:
             end = min(offset + self.BLE_CHUNK_SIZE, total)
             chunk = data[offset:end]
             await self._client.write_gatt_char(
-                self._rx_uuid, chunk, response=False
+                self._rx_uuid, chunk, response=response
             )
             offset = end
             if offset < total:
